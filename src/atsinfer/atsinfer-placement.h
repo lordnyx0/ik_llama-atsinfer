@@ -14,8 +14,11 @@ enum class ATSInferBackend {
 
 struct atsinfer_placement_decision {
     std::unordered_map<std::string, ATSInferBackend> placement;
-    size_t total_vram_used_bytes;
-    float expected_total_latency_ms;
+    // must be initialized here: atsinfer_compute_static_placement() default-initializes
+    // its local `result` and then accumulates into these with +=, which reads an
+    // indeterminate value (UB). Observed as "VRAM used: 7677182227.62 GiB" in the loader log.
+    size_t total_vram_used_bytes   = 0;
+    float  expected_total_latency_ms = 0.0f;
 };
 
 // Algoritmo 1: Static Tensor Placement Solver (Dense & MoE)

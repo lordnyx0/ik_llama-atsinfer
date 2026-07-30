@@ -6,6 +6,10 @@
 #include "atsinfer/atsinfer-profiler.h"
 #include "atsinfer/atsinfer-placement.h"
 
+#ifdef GGML_USE_CUDA
+#  include "ggml-cuda.h"
+#endif
+
 
 #include <set>
 #include <map>
@@ -387,10 +391,40 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
             tensor_profiles.push_back(tp);
         }
 
-        // 4. Determine VRAM budget: use atsinfer_vram_budget if set, else use hw profile
-        uint64_t vram_budget_bytes = ml.atsinfer_vram_budget > 0
-            ? (uint64_t)ml.atsinfer_vram_budget * 1024ULL * 1024ULL
-            : hw_profile.gpu_vram_budget;
+        // 4. Determine the VRAM budget for weights.
+        //    atsinfer_profile_hardware() echoes back whatever budget it was handed and
+        //    never queries the device, so both the "0 = auto" path and an over-large
+        //    user value have to be resolved here against real free VRAM. Getting this
+        //    wrong is not a graceful failure: on Windows/WDDM an oversubscribed CUDA
+        //    allocation silently spills to system memory over PCIe. Measured with a
+        //    15000 MiB budget on a 12288 MiB card, the loader placed 14700 MiB of
+        //    weights on CUDA0 and decode collapsed to 5.78 tok/s (vs 37.94 tok/s).
+        //    The budget must also leave room for the KV cache and compute buffers,
+        //    which the solver does not model -- mirror --fit-margin's reservation.
+        uint64_t vram_budget_bytes = (uint64_t)ml.atsinfer_vram_budget * 1024ULL * 1024ULL;
+        {
+            size_t vram_free = 0;
+#ifdef GGML_USE_CUDA
+            if (!model.devices.empty()) {
+                size_t total = 0;
+                ggml_backend_cuda_get_device_memory(model.devices[0], &vram_free, &total);
+            }
+#endif
+            // reserve headroom for KV cache, compute buffers and backend context
+            const uint64_t reserve = 1024ULL * 1024ULL * 1024ULL;
+            const uint64_t usable  = vram_free > reserve ? (uint64_t)vram_free - reserve : 0;
+
+            if (vram_budget_bytes == 0) {
+                vram_budget_bytes = usable;
+                LLAMA_LOG_INFO("%s: ATSInfer auto VRAM budget: %.2f GiB (%.2f GiB free - 1.00 GiB reserved)\n",
+                        __func__, vram_budget_bytes/1073741824.0, vram_free/1073741824.0);
+            } else if (usable > 0 && vram_budget_bytes > usable) {
+                LLAMA_LOG_WARN("%s: ATSInfer VRAM budget %.2f GiB exceeds usable VRAM; clamping to %.2f GiB "
+                        "(%.2f GiB free - 1.00 GiB reserved)\n", __func__,
+                        vram_budget_bytes/1073741824.0, usable/1073741824.0, vram_free/1073741824.0);
+                vram_budget_bytes = usable;
+            }
+        }
 
         // 5. Run DP placement solver
         bool is_moe = (model.hparams.n_expert > 0);
@@ -430,8 +464,19 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
         // get_context_for_tensor() takes the FIRST matching override and breaks, and the
         // entries above (-ot, --n-cpu-moe, --fit) were appended earlier, so appending here
         // means explicit user placement always wins over the ATSInfer solver.
-        size_t n_gpu_overrides = 0;
+        // The solver only reasons about repeating transformer layers. Global tensors
+        // (token_embd, output head, final norms) have placement rules of their own that
+        // it does not model: llama_model_load() pins buft_input to the CPU because
+        // "there is very little benefit to offloading the input layer", and buft_output
+        // follows n_gpu_layers. Letting the solver override those measurably hurts --
+        // it drags token_embd.weight (272 MiB) and output.weight (398 MiB) onto the GPU
+        // and costs ~40% decode throughput. Restrict overrides to "blk.N." tensors.
+        size_t n_gpu_overrides = 0, n_skipped_global = 0;
         for (auto & [tensor_name, buft] : buft_map) {
+            if (tensor_name.compare(0, 4, "blk.") != 0) {
+                ++n_skipped_global;
+                continue;
+            }
             // Escape regex metacharacters in a SINGLE pass. A per-character loop that
             // handles '\\' after '.' would re-escape the backslashes it just inserted,
             // turning "blk.0.x" into "blk\\.0\\.x" (literal backslash + any char), which
@@ -448,8 +493,10 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
             if (buft != cpu_buft) ++n_gpu_overrides;
             overrides.emplace_back(std::make_pair(std::regex("^" + escaped + "$"), buft));
         }
-        LLAMA_LOG_INFO("%s: ATSInfer injected %zu buffer-type overrides (%zu GPU / %zu CPU)\n",
-                __func__, buft_map.size(), n_gpu_overrides, buft_map.size() - n_gpu_overrides);
+        const size_t n_injected = buft_map.size() - n_skipped_global;
+        LLAMA_LOG_INFO("%s: ATSInfer injected %zu buffer-type overrides (%zu GPU / %zu CPU), "
+                "%zu global tensors left to the model's own placement\n",
+                __func__, n_injected, n_gpu_overrides, n_injected - n_gpu_overrides, n_skipped_global);
 
         // 7. Persist profile cache if newly measured
         if (!cache_loaded) {
