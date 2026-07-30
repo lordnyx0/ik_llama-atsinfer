@@ -11,13 +11,48 @@ This repository contains an experimental exploration of **ATSInfer** (*Automated
 ### 🔍 Technical Audit & Architecture Breakdown
 
 > [!IMPORTANT]
-> **Real ATSInfer Implementation Scope**:
-> - **Real Hardware Profiling (`src/atsinfer/atsinfer-profiler.cpp`)**: Dynamically measures PCIe Host-to-Device (H2D) and Device-to-Host (D2H) transfer bandwidth via pinned host memory (`cudaHostAlloc`) and CUDA event timing (`cudaEventElapsedTime`). Includes structured profile disk persistence (`atsinfer_save_profile_cache` / `atsinfer_load_profile_cache`).
-> - **Static Placement Bridge (`src/atsinfer/atsinfer-placement.cpp`)**: Converts 3D Knapsack dynamic programming solver decisions directly into per-tensor `ggml_backend_buffer_type_t` memory buffer mappings (`atsinfer_map_placement_to_buft`).
-> - **Residency Tracking & VRAM Cache (`src/atsinfer/atsinfer-cache.cpp`)**: Implements `ATSInferTensorCache` managing GPU VRAM allocation with LRU, Layer-Distance, and MoE Active-Expert Priority eviction policies, guarded by in-flight reference counting locks.
-> - **Asynchronous CUDA Stream Engine (`src/atsinfer/atsinfer-cuda.cpp`)**: Implements `ATSInferCudaManager` owning dedicated non-blocking CUDA compute and transfer streams with `cudaMemcpyAsync` and CUDA event dependency synchronization (`cudaStreamWaitEvent`).
-> - **Automated Benchmark Harness (`scripts/benchmark-atsinfer.py`)**: Reproducible benchmark script parsing throughput and latency metrics to JSON outputs.
-> - **8/8 Verified Unit Tests (`tests/test-atsinfer.cpp`)**: Full test coverage verified under `CTest`.
+> **ATSInfer was implemented, wired into the runtime, and measured end to end. It does not improve
+> decode throughput on this hardware.** The reasons are structural, not defects — see
+> **[docs/atsinfer-findings.md](docs/atsinfer-findings.md)** for the measurements and root causes.
+> The performance of this fork comes from `ik_llama.cpp`'s own mechanisms (`only_active_experts`,
+> `-ncmoe` / `--fit`, `sched_async`, fused MoE), not from ATSInfer.
+
+**Integrated and active**
+
+- **Per-split profiling** (`ggml_backend_sched_set_profiling`, `..._get_split_timings`): measures
+  execution and input-copy time per graph split, zero cost when disabled. This is what produced
+  every number below.
+- **Static placement solver** (`--atsinfer`): runs at load time and drives real
+  `ggml_backend_buffer_type_t` overrides. Off by default; it currently **loses 4.2x on decode**
+  because the knapsack treats a layer's `ffn_up` / `ffn_gate` / `ffn_down` independently, breaking
+  `GGML_OP_MOE_FUSED_UP_GATE`.
+- **Hardware profiling** (`atsinfer-profiler.cpp`): measures H2D/D2H bandwidth with CUDA events and
+  persists to disk. Note the measurement is unstable run to run (2.7–11.8 GB/s observed), and the
+  cache carries no model or hardware hash.
+
+**Implemented, tested, inactive by default**
+
+- **Load-aware dynamic transfer** (`--atsinfer-dynamic`, Algorithms 2 and 3 of the paper): the DP
+  and the rate-limited re-scheduling gate are implemented and unit tested, and wired into the
+  decode loop. It has no headroom here — promoting one expert layer saves ~0.65 ms and costs
+  ~1.4 ms of PCIe.
+- **`ATSInferCudaManager` / `ATSInferTensorCache`**: instantiated but **not consumed by any code
+  path**. They were built for the asynchronous coordination mechanism, which measured neutral and
+  was reverted.
+
+**Not applicable on this stack**
+
+- **Asynchronous CPU-GPU coordination** (section 4.2 of the paper): moving H2D weight copies to a
+  dedicated stream was implemented and measured A/B — 39.60 ± 0.23 vs 38.95 ± 0.39 tok/s. It cannot
+  help, because selective expert transfer must read the routing ids back to the host first, and
+  that readback is a full device synchronize. The compute stream is already drained when the copies
+  are issued, so there is nothing to overlap with. This also rules out the Zero-Copy copy-kernel
+  path.
+
+**Tooling**
+
+- `llama-bench` accepts `--atsinfer`, `--atsinfer-vram-budget` and `--atsinfer-dynamic`.
+- 8/8 unit tests (`tests/test-atsinfer.cpp`) under `CTest`.
 
 ---
 
@@ -25,37 +60,59 @@ This repository contains an experimental exploration of **ATSInfer** (*Automated
 
 Tested on NVIDIA GeForce RTX 3060 (12GB VRAM) + x86-64 CPU (8 Threads) with 32,000 context size and 19.70 GiB model weights.
 
-> [!NOTE]
-> **Live Verification** (`llama-cli` — prompt: *"faça um texto sobre a lua"*, 264 tokens total, July 30 2026):
-> Decode throughput confirmed at **33.99 tok/s** — within 0.1% of the benchmark reference (**34.02 tok/s**), validating reproducibility.
+> [!WARNING]
+> **Do not measure MoE decode with `llama-cli`.** Three runs of an identical command gave 36.67,
+> 34.78 and 21.50 tok/s. With host-resident experts, routing decides how many expert bytes cross
+> PCIe per token, so throughput depends on *which tokens are generated* — and changing placement
+> changes rounding, sampling, and therefore the token stream. Use `llama-bench`, which gives
+> σ ≈ 0.6% on the same configuration.
 
-| Performance Metric | Official Baseline (`llama.cpp`) | **ik_llama.cpp / ATSInfer CUDA** | Performance Delta & Technical Cause |
-| :--- | :--- | :--- | :--- |
-| **Prefill Throughput (tok/s)** | 16.52 tok/s | **38.06 tok/s** | **+130.4% (+2.30× Speedup)** (Driven by `sched_async = 1` + Flash Attention) |
-| **Prompt Eval Time (20 tokens)** | 1,210.53 ms | **525.50 ms** | **56.6% Faster** (Reduced prompt evaluation latency) |
-| **Decode Throughput (tok/s)** | 32.46 tok/s | **34.02 tok/s** *(live: 33.99 tok/s ✅)* | **+4.8%** (Boosted by CUDA async stream transfer overlap & MoE expert cache) |
-| **Total Request Latency (256 tokens)** | 7,270.24 ms | **5,964.22 ms** | **1.31 Seconds Faster** total generation delivery |
-| **GPU VRAM Allocation** | 9.74 GiB | **9.87 GiB** | Physical VRAM budget enforced (Prevents WDDM 7.95 tok/s paging collapse) |
-| **CPU Pinned RAM** | 10.19 GiB | **9.83 GiB** | Host Pinned Memory allocated for MoE expert weights (`cudaHostAlloc`) |
+Measured with `llama-bench -p 512 -n 64 -r 3 -t 8 -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -mmp 0`:
 
-**Live test config** (July 30 2026): `--fit --fit-margin 256 -rtr -fa on -ctk q8_0 -ctv q8_0 -c 32000 --temp 0.7 --top-k 40 -t 8 --no-mmap`
-- Repacked tensors: **63** | Graph splits: **44** | KV Cache (q8_0): **332.03 MiB**
-- `sched_async=1` ✅ | `flash_attn=1` ✅ | `fused_moe=1` ✅ | `only_active_experts scheduling` ✅
+| Configuration | Prefill (pp512) | Decode (tg64) |
+| :--- | ---: | ---: |
+| `--n-cpu-moe 19` (recommended) | 183.07 ± 20.76 | **38.34 ± 0.23** |
+| `--fit --fit-margin 256` | — | 33.85 ± 0.25 |
+| `--atsinfer` (static solver) | 204.05 ± 10.35 | 9.15 ± 0.03 |
+
+Prefill has σ of 10–25% even under `llama-bench` and is not conclusive here; decode is clean.
+
+**Round composition** during decode, from the per-split profiler:
+
+| exec CPU | exec GPU | input copy | round |
+| ---: | ---: | ---: | ---: |
+| ~13 ms | ~11.5 ms | ~1.9 ms | ~26 ms |
+
+About 87% of the round is dependent, sequential compute — layer N+1 consumes layer N's output, so
+CPU and GPU work sums rather than overlaps, and no scheduling mechanism removes that at batch
+size 1. Only the ~7% spent in transfers is overlappable at all.
+
+**Config**: `-ngl 99 --n-cpu-moe 19 -fa on -ctk q8_0 -ctv q8_0 -t 8 --no-mmap`
+- Graph splits: **44** | `only_active_experts` ✅ | `sched_async=1` ✅ | `flash_attn=1` ✅
 
 ---
 
 ### 🛠️ Runtime & Subsystem Architecture Summary
 
-1. **ATSInfer Asynchronous CUDA Transfer Stream**:
-   - Manages dedicated transfer and compute streams per CUDA device (`ATSInferCudaManager`), issuing non-blocking host-to-device transfers with CUDA event barriers.
-2. **MoE Expert Priority VRAM Cache Management**:
-   - `ATSInferTensorCache` dynamically evicts least-recently-used inactive MoE expert weights when dynamic promotion is triggered under VRAM constraints.
-3. **Hardware Bandwidth Profiling & Profile Persistence**:
-   - `atsinfer_profile_hardware()` replaces static bandwidth estimates with empirical CUDA `cudaMemcpyAsync` benchmarks cached to disk.
-4. **Physical VRAM Budget Enforcement**:
-   - Usage of `--fit --fit-margin 256` prevents Windows WDDM CUDA System Memory Paging, avoiding driver thrashing that drops decode performance down to ~7.95 tok/s when VRAM capacity is exceeded.
-5. **Comprehensive ATSInfer Unit Test Suite (8/8 Passed)**:
-   - Built and verified via `tests/test-atsinfer.cpp` (`test-atsinfer.exe`) and `CTest`.
+1. **Selective MoE expert transfer** (`only_active_experts`, inherited from `ik_llama.cpp`):
+   - `ggml_backend_sched_copy_inputs()` reads the routing ids, then copies **only the ~8 routed
+     experts** of a layer instead of all 128, coalescing contiguous ranges. This is the single
+     biggest reason this fork is fast on MoE, and it is also why the ATSInfer coordination
+     mechanism has nothing left to optimise.
+2. **Layer-granularity MoE placement** (`-ncmoe` / `--fit`):
+   - Routes whole expert groups to pinned host memory while attention and norms stay in VRAM.
+     `-ncmoe 19` is the measured optimum for this model at 4k context.
+3. **Physical VRAM budget enforcement**:
+   - `--fit --fit-margin 256` prevents Windows WDDM CUDA system-memory paging. Exceeding VRAM does
+     not fail — it silently spills over PCIe. Measured collapse: 5.78 tok/s with a 15000 MiB budget
+     requested on a 12288 MiB card.
+4. **Per-split profiling** (added for this work):
+   - `ggml_backend_sched_set_profiling()` records execution and input-copy time per graph split.
+     Enabling it serializes the round on purpose, so it is meant for occasional calibration rounds
+     rather than steady state.
+5. **ATSInfer research prototypes** (`src/atsinfer/`, `src/llama-atsinfer.cpp`):
+   - Static placement solver, dynamic transfer DP, and re-scheduling gate. Off by default; see the
+     findings document for why. 8/8 unit tests via `tests/test-atsinfer.cpp` and `CTest`.
 
 ---
 

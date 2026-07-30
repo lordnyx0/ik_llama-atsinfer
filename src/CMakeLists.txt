@@ -45,6 +45,7 @@ add_library(llama
             atsinfer/atsinfer-cache.cpp
             atsinfer/atsinfer-cuda.cpp
             llama.cpp
+            llama-atsinfer.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
             llama-dflash.cpp

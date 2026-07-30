@@ -140,25 +140,72 @@ void test_static_placement_moe() {
     std::cout << " -> Static Placement MoE Test PASSED!" << std::endl;
 }
 
+static atsinfer_round_unit mk_unit(int layer, bool static_gpu, float t_cpu, float t_gpu, float c, float w) {
+    atsinfer_round_unit u;
+    u.layer      = layer;
+    u.static_gpu = static_gpu;
+    u.t_cpu_ms   = t_cpu;
+    u.t_gpu_ms   = t_gpu;
+    u.c_ms       = c;
+    u.w_ms       = w;
+    return u;
+}
+
 void test_dynamic_transfer_scheduler() {
-    std::cout << "[TEST] Running Dynamic Transfer Scheduler Test..." << std::endl;
-    std::vector<atsinfer_tensor_profile> profiles;
+    std::cout << "[TEST] Running Dynamic Transfer Scheduler Test (Algorithm 2)..." << std::endl;
 
-    atsinfer_tensor_profile p1;
-    p1.tensor_name = "layer.0.weight";
-    p1.size_bytes = 100 * 1024 * 1024;
-    p1.exec_time_cpu_ms = 25.0f;
-    p1.exec_time_gpu_ms = 2.0f;
-    p1.latency_reduction = 23.0f;
-    p1.switching_cost_ms = 2.0f;
-    profiles.push_back(p1);
+    // GPU-resident units are forced to the GPU regardless of their timings.
+    {
+        std::vector<atsinfer_round_unit> units = {
+            mk_unit(0, true, 25.0f, 2.0f, 1.0f, 0.0f),
+            mk_unit(1, true, 25.0f, 2.0f, 1.0f, 0.0f),
+        };
+        auto plan = atsinfer_schedule_round(units);
+        assert(plan.run_on_gpu.size() == 2);
+        assert(plan.run_on_gpu[0] == 1 && plan.run_on_gpu[1] == 1);
+        assert(plan.n_promoted == 0);
+    }
 
-    std::unordered_map<std::string, ATSInferBackend> static_map;
-    static_map["layer.0.weight"] = ATSInferBackend::CPU;
+    // A lone CPU unit whose weight transfer costs more than the CPU/GPU gap stays put.
+    // Nothing precedes it, so the whole transfer is exposed: 40 + 2 > 25.
+    {
+        std::vector<atsinfer_round_unit> units = { mk_unit(0, false, 25.0f, 2.0f, 1.0f, 40.0f) };
+        auto plan = atsinfer_schedule_round(units);
+        assert(plan.run_on_gpu[0] == 0);
+        assert(plan.n_promoted == 0);
+    }
 
-    auto dyn_sched = atsinfer_dynamic_transfer_schedule(profiles, static_map, 16000.0f);
-    assert(dyn_sched.promoted_tensors_to_gpu.size() == 1);
-    assert(dyn_sched.promoted_tensors_to_gpu[0] == "layer.0.weight");
+    // Same unit, but cheap to transfer: promoting is now the better option.
+    {
+        std::vector<atsinfer_round_unit> units = { mk_unit(0, false, 25.0f, 2.0f, 1.0f, 3.0f) };
+        auto plan = atsinfer_schedule_round(units);
+        assert(plan.run_on_gpu[0] == 1);
+        assert(plan.n_promoted == 1);
+    }
+
+    // The overlap window is what makes promotion pay off. Unit 2's transfer (20 ms) is
+    // expensive on its own, but it can be hidden behind unit 1's 30 ms of CPU work, so the
+    // exposed cost is zero and unit 2 should be promoted while unit 1 stays on the CPU.
+    {
+        std::vector<atsinfer_round_unit> units = {
+            mk_unit(0, false, 30.0f, 3.0f, 1.0f, 100.0f), // too expensive to move
+            mk_unit(1, false, 30.0f, 3.0f, 1.0f,  20.0f), // hidden behind unit 0
+        };
+        auto plan = atsinfer_schedule_round(units);
+        assert(plan.run_on_gpu[0] == 0);
+        assert(plan.run_on_gpu[1] == 1);
+        assert(plan.n_promoted == 1);
+        // 30 (cpu unit 0) + max(20, 0 overlap window between j=0 and i=1) + 1 (switch) + 3 (gpu)
+        assert(plan.estimated_latency_ms > 0.0f);
+    }
+
+    // Degenerate input must not crash.
+    {
+        auto plan = atsinfer_schedule_round({});
+        assert(plan.run_on_gpu.empty());
+        assert(plan.n_promoted == 0);
+    }
+
     std::cout << " -> Dynamic Transfer Scheduler Test PASSED!" << std::endl;
 }
 
@@ -166,9 +213,9 @@ void test_load_aware_rescheduler() {
     std::cout << "[TEST] Running Load-Aware Rescheduler Test..." << std::endl;
     ATSInferRescheduler rescheduler(0.15f, 5);
 
-    // Initial state
+    // Initial state: no plan exists yet, so schedule once unconditionally
     assert(rescheduler.should_reschedule(0.0f, 40.0f, 40.0f) == true);
-    rescheduler.record_reschedule_event(40.0f);
+    rescheduler.record_reschedule_event();
 
     // Small deviation (5%) - should NOT reschedule
     assert(rescheduler.should_reschedule(40.0f, 42.0f, 40.0f) == false);
@@ -219,6 +266,26 @@ void test_profile_serialization() {
     assert(profiles_loaded.find("blk.3.attn_q.weight") != profiles_loaded.end());
     assert(profiles_loaded["blk.3.attn_q.weight"].layer_id == 3);
     assert(profiles_loaded["blk.3.attn_q.weight"].is_attn == true);
+
+    // A cache written for a different model must be rejected, not silently applied. This
+    // actually happened: a 40-layer MoE profile was loaded for a 65-layer dense model and the
+    // solver placed tensors that did not exist in it.
+    {
+        std::unordered_map<std::string, atsinfer_tensor_profile> wrong_model;
+        atsinfer_hardware_profile hw_tmp;
+        const size_t right_bytes = atsinfer_profile_total_bytes(profiles_orig);
+
+        assert(atsinfer_load_profile_cache(cache_path, hw_tmp, wrong_model,
+                    profiles_orig.size(), right_bytes) == true);
+
+        assert(atsinfer_load_profile_cache(cache_path, hw_tmp, wrong_model,
+                    profiles_orig.size() + 1, right_bytes) == false);
+        assert(wrong_model.empty());
+
+        assert(atsinfer_load_profile_cache(cache_path, hw_tmp, wrong_model,
+                    profiles_orig.size(), right_bytes + 1) == false);
+        assert(wrong_model.empty());
+    }
 
     std::remove(cache_path.c_str());
     std::cout << " -> Profile Serialization Test PASSED!" << std::endl;

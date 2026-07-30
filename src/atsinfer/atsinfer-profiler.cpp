@@ -196,6 +196,12 @@ bool atsinfer_save_profile_cache(
     if (!out.is_open()) return false;
 
     out << "# ATSInfer Profile Cache\n";
+    // Version + model fingerprint. Without this the cache is silently reused across models:
+    // loading a 40-layer MoE profile for a 65-layer dense model made the solver place tensors
+    // that do not exist and ignore the ones that do. The fingerprint is the tensor count and
+    // total byte size, which is enough to catch a different model or a different quantization.
+    out << "V 2\n";
+    out << "MODEL " << profiles.size() << " " << atsinfer_profile_total_bytes(profiles) << "\n";
     out << "HW " << hw.pcie_bandwidth_mbps << " " << hw.pcie_d2h_bandwidth_mbps << " "
         << hw.gpu_vram_budget << " " << (hw.is_measured ? 1 : 0) << "\n";
 
@@ -210,15 +216,30 @@ bool atsinfer_save_profile_cache(
     return true;
 }
 
+size_t atsinfer_profile_total_bytes(const std::unordered_map<std::string, atsinfer_tensor_profile> & profiles) {
+    size_t total = 0;
+    for (const auto & kv : profiles) {
+        total += kv.second.size_bytes;
+    }
+    return total;
+}
+
 bool atsinfer_load_profile_cache(
     const std::string & filename,
     atsinfer_hardware_profile & hw,
-    std::unordered_map<std::string, atsinfer_tensor_profile> & profiles) {
+    std::unordered_map<std::string, atsinfer_tensor_profile> & profiles,
+    size_t expect_n_tensors,
+    size_t expect_total_bytes) {
 
     std::ifstream in(filename);
     if (!in.is_open()) return false;
 
     profiles.clear();
+    int    version          = 0;
+    size_t cached_n_tensors = 0;
+    size_t cached_total     = 0;
+    bool   have_model_line  = false;
+
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -226,7 +247,12 @@ bool atsinfer_load_profile_cache(
         std::string tag;
         iss >> tag;
 
-        if (tag == "HW") {
+        if (tag == "V") {
+            iss >> version;
+        } else if (tag == "MODEL") {
+            iss >> cached_n_tensors >> cached_total;
+            have_model_line = true;
+        } else if (tag == "HW") {
             int is_meas = 0;
             iss >> hw.pcie_bandwidth_mbps >> hw.pcie_d2h_bandwidth_mbps >> hw.gpu_vram_budget >> is_meas;
             hw.is_measured = (is_meas != 0);
@@ -248,6 +274,19 @@ bool atsinfer_load_profile_cache(
 
             profiles[p.tensor_name] = p;
         }
+    }
+
+    // Reject a cache written for a different model, a different quantization, or by an older
+    // version that carried no fingerprint at all. Silently reusing it makes the solver place
+    // tensors that do not exist in the model being loaded.
+    if (version < 2 || !have_model_line) {
+        profiles.clear();
+        return false;
+    }
+    if (expect_n_tensors != 0 &&
+            (cached_n_tensors != expect_n_tensors || cached_total != expect_total_bytes)) {
+        profiles.clear();
+        return false;
     }
 
     return true;

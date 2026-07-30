@@ -45,10 +45,18 @@ bool atsinfer_save_profile_cache(
     const std::unordered_map<std::string, atsinfer_tensor_profile> & profiles
 );
 
+// Total footprint of a profile set, used as part of the cache's model fingerprint
+size_t atsinfer_profile_total_bytes(const std::unordered_map<std::string, atsinfer_tensor_profile> & profiles);
+
+// Returns false when the cache is missing, was written by an older version, or was written for a
+// different model. Pass expect_n_tensors = 0 to skip the model check (tests only) -- in the loader
+// it must be supplied, otherwise a profile from another model is applied silently.
 bool atsinfer_load_profile_cache(
     const std::string & filename,
     atsinfer_hardware_profile & hw,
-    std::unordered_map<std::string, atsinfer_tensor_profile> & profiles
+    std::unordered_map<std::string, atsinfer_tensor_profile> & profiles,
+    size_t expect_n_tensors = 0,
+    size_t expect_total_bytes = 0
 );
 
 #endif // ATSINFER_PROFILER_H

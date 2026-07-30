@@ -4219,6 +4219,15 @@ GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // NOTE: moving this copy to a dedicated transfer stream (arXiv 2607.10183v2 section 4.2.2)
+    // was implemented and measured here, and does not help for MoE decode. Selective expert
+    // transfer under only_active_experts has to read the routing ids back to the host first,
+    // and ggml_backend_sched_copy_inputs() does that with a full device synchronize (see the
+    // ggml_backend_synchronize(ids_backend) call in ggml-backend.cpp). By the time the expert
+    // copies are issued the compute stream is already drained, so there is no in-flight work
+    // left to overlap with. Measured A/B on an RTX 3060 with a 35B-A3B MoE: 39.60 +/- 0.23
+    // tok/s on the compute stream vs 38.95 +/- 0.39 on a dedicated stream.
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 

@@ -2,6 +2,12 @@
 
 This document describes the technical architecture mapping, implementation scope, and audited status of **ATSInfer** (*Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference on Consumer Devices*, arXiv:2607.10183v2) within `ik_llama.cpp`.
 
+> **Superseded in part.** The mechanisms described below as standalone have since been wired into
+> the loader, the context and the decode loop, and measured end to end. None of them improves
+> decode throughput on this hardware, for reasons that are structural rather than defects. See
+> **[atsinfer-findings.md](atsinfer-findings.md)** for the measurements, the root causes, and what
+> to do if the work is picked up again. Read that document first.
+
 ---
 
 ## 1. Audited Implementation Scope

@@ -365,11 +365,19 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
             if (t) all_tensors.push_back(t);
         }
 
-        // 2. Load or measure hardware bandwidth profile
+        // 2. Load or measure hardware bandwidth profile.
+        //    The cache is keyed on the model's tensor count and total size, so a profile written
+        //    for another model is rejected instead of being applied to tensors that do not exist.
+        size_t model_total_bytes = 0;
+        for (const auto * t : all_tensors) {
+            model_total_bytes += ggml_nbytes(t);
+        }
+
         atsinfer_hardware_profile hw_profile;
         std::unordered_map<std::string, atsinfer_tensor_profile> cached_profiles;
         const std::string cache_path = "atsinfer_profile.cache";
-        bool cache_loaded = atsinfer_load_profile_cache(cache_path, hw_profile, cached_profiles);
+        bool cache_loaded = atsinfer_load_profile_cache(cache_path, hw_profile, cached_profiles,
+                all_tensors.size(), model_total_bytes);
         if (!cache_loaded) {
             uint64_t vram_budget_bytes = (uint64_t)ml.atsinfer_vram_budget * 1024ULL * 1024ULL;
             hw_profile = atsinfer_profile_hardware(vram_budget_bytes);
