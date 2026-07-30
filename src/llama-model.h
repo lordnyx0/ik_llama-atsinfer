@@ -505,6 +505,11 @@ struct llama_model {
 
     bool mtp; // use mtp if is supported by the Model
 
+    // ATSInfer hybrid scheduling
+    bool    atsinfer_enable      = false;
+    int32_t atsinfer_vram_budget = 0;
+    bool    atsinfer_dynamic     = false;
+
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
     std::vector<int32_t> default_layer_device;

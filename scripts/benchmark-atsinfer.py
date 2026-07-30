@@ -36,6 +36,16 @@ def get_system_context():
 
     return ctx
 
+def check_atsinfer_support(executable_path):
+    """Return True if the binary's CLI parser knows the --atsinfer flags."""
+    try:
+        proc = subprocess.run([executable_path, "--help"], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=60)
+    except Exception as e:
+        print(f"WARNING: could not probe '{executable_path}' for ATSInfer support: {e}")
+        return False
+    return "--atsinfer" in proc.stdout
+
 def run_benchmark(executable_path, model_path, prompt, n_predict, vram_budget_mb, mode):
     cmd = [
         executable_path,
@@ -44,10 +54,12 @@ def run_benchmark(executable_path, model_path, prompt, n_predict, vram_budget_mb
         "-n", str(n_predict),
     ]
 
+    # NOTE: --atsinfer-vram-budget is expressed in MiB (see common/common.cpp),
+    # so pass vram_budget_mb straight through -- do not convert to bytes.
     if mode == "static_atsinfer":
-        cmd.extend(["--atsinfer", "--atsinfer-vram-budget", str(vram_budget_mb * 1024 * 1024)])
+        cmd.extend(["--atsinfer", "--atsinfer-vram-budget", str(vram_budget_mb)])
     elif mode == "dynamic_atsinfer":
-        cmd.extend(["--atsinfer", "--atsinfer-vram-budget", str(vram_budget_mb * 1024 * 1024), "--atsinfer-dynamic"])
+        cmd.extend(["--atsinfer", "--atsinfer-vram-budget", str(vram_budget_mb), "--atsinfer-dynamic"])
 
     print(f"Executing: {' '.join(cmd)}")
     start_t = time.time()
@@ -107,18 +119,24 @@ def main():
 
     args = parser.parse_args()
 
+    atsinfer_supported = check_atsinfer_support(args.exe)
+    if not atsinfer_supported:
+        print("WARNING: binary does not expose --atsinfer flags; running baseline only.")
+
     sys_context = get_system_context()
     results = {
         "system_context": sys_context,
         "benchmark_config": {
             "model": args.model,
             "n_predict": args.n_predict,
-            "vram_budget_mb": args.vram_budget_mb
+            "vram_budget_mb": args.vram_budget_mb,
+            "atsinfer_supported": atsinfer_supported
         },
         "runs": []
     }
 
-    for mode in ["baseline", "static_atsinfer", "dynamic_atsinfer"]:
+    modes = ["baseline", "static_atsinfer", "dynamic_atsinfer"] if atsinfer_supported else ["baseline"]
+    for mode in modes:
         print(f"\n--- Running Mode: {mode} ---")
         run_res = run_benchmark(args.exe, args.model, args.prompt, args.n_predict, args.vram_budget_mb, mode)
         results["runs"].append(run_res)

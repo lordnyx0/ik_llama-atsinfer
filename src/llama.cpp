@@ -4694,6 +4694,14 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 
         model.mtp = params.mtp;
 
+        // ATSInfer: propagate placement params to loader and model
+        ml.atsinfer_enable      = params.atsinfer_enable;
+        ml.atsinfer_vram_budget = params.atsinfer_vram_budget;
+        ml.atsinfer_dynamic     = params.atsinfer_dynamic;
+        model.atsinfer_enable      = params.atsinfer_enable;
+        model.atsinfer_vram_budget = params.atsinfer_vram_budget;
+        model.atsinfer_dynamic     = params.atsinfer_dynamic;
+
         try {
             llm_load_arch(ml, model);
         } catch(const std::exception & e) {
@@ -7236,6 +7244,9 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.atsinfer_enable             =*/ false,
+        /*.atsinfer_vram_budget        =*/ 0,
+        /*.atsinfer_dynamic            =*/ false,
     };
 
 #ifdef GGML_USE_METAL
@@ -8347,6 +8358,29 @@ struct llama_context * llama_init_from_model(
             if (ctx->buf_output == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             }
+        }
+    }
+
+    // ATSInfer: instantiate runtime objects if enabled
+    if (model->atsinfer_enable) {
+        int device_id = model->devices.empty() ? 0 : 0; // use first CUDA device
+        ctx->atsinfer_cuda = std::make_unique<ATSInferCudaManager>();
+        if (!ctx->atsinfer_cuda->init(device_id)) {
+            LLAMA_LOG_WARN("%s: ATSInfer CUDA manager init failed — disabling ATSInfer runtime\n", __func__);
+            ctx->atsinfer_cuda.reset();
+        } else {
+            uint64_t vram_budget = model->atsinfer_vram_budget > 0
+                ? (uint64_t)model->atsinfer_vram_budget * 1024ULL * 1024ULL
+                : 0; // 0 = uncapped, cache eviction handles VRAM limits
+            ctx->atsinfer_cache = std::make_unique<ATSInferTensorCache>(vram_budget);
+            if (model->atsinfer_dynamic) {
+                ctx->atsinfer_sched = std::make_unique<ATSInferRescheduler>(
+                    /*deviation_threshold=*/0.15f,
+                    /*min_interval_tokens=*/5
+                );
+            }
+            LLAMA_LOG_INFO("%s: ATSInfer runtime initialized (VRAM budget: %d MiB, dynamic: %d)\n",
+                __func__, model->atsinfer_vram_budget, (int)model->atsinfer_dynamic);
         }
     }
 

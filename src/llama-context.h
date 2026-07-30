@@ -5,6 +5,9 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
+#include "atsinfer/atsinfer-cuda.h"
+#include "atsinfer/atsinfer-cache.h"
+#include "atsinfer/atsinfer-scheduler.h"
 
 struct llama_model;
 
@@ -303,6 +306,11 @@ struct llama_context {
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+
+    // ATSInfer hybrid CPU/GPU scheduling runtime
+    std::unique_ptr<ATSInferCudaManager>  atsinfer_cuda;   // async CUDA streams & H2D transfers
+    std::unique_ptr<ATSInferTensorCache>  atsinfer_cache;  // VRAM residency tracker with eviction
+    std::unique_ptr<ATSInferRescheduler>  atsinfer_sched;  // dynamic latency-driven rescheduler
 
     const float * draft_input_hidden_state = nullptr;
     size_t draft_input_hidden_state_n_floats = 0;
