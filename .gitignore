@@ -26,6 +26,7 @@
 
 .cache/
 .ccls-cache/
+.codegraph/
 .direnv/
 .envrc
 .idea/

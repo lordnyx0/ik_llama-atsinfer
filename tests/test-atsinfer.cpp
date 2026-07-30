@@ -1,10 +1,59 @@
 #include "atsinfer/atsinfer-profiler.h"
 #include "atsinfer/atsinfer-placement.h"
 #include "atsinfer/atsinfer-scheduler.h"
+#include "atsinfer/atsinfer-cache.h"
+#include "atsinfer/atsinfer-cuda.h"
 #include <iostream>
 #include <cassert>
 #include <vector>
 #include <cmath>
+
+void test_tensor_cache() {
+    std::cout << "[TEST] Running Tensor Cache & Eviction Test..." << std::endl;
+    size_t budget = 1000 * 1024 * 1024; // 1000 MB VRAM budget
+    ATSInferTensorCache cache(budget);
+
+    cache.register_tensor("layer.0.w", 400 * 1024 * 1024, 0, false, false, ATSInferResidency::CPU_AND_GPU);
+    cache.register_tensor("layer.1.w", 400 * 1024 * 1024, 1, false, false, ATSInferResidency::CPU_AND_GPU);
+    cache.register_tensor("layer.2.w", 400 * 1024 * 1024, 2, false, false, ATSInferResidency::CPU_ONLY);
+
+    cache.update_usage("layer.0.w", 100);
+    cache.update_usage("layer.1.w", 200);
+
+    std::vector<std::string> evicted;
+    bool reserved = cache.reserve_gpu_space("layer.2.w", 400 * 1024 * 1024, 2, evicted);
+    assert(reserved);
+    assert(evicted.size() == 1);
+    assert(evicted[0] == "layer.0.w"); // LRU candidate evicted
+
+    auto * state0 = cache.get_tensor_state("layer.0.w");
+    assert(state0->residency == ATSInferResidency::CPU_ONLY);
+    auto * state2 = cache.get_tensor_state("layer.2.w");
+    assert(state2->residency == ATSInferResidency::CPU_AND_GPU);
+
+    std::cout << " -> Tensor Cache & Eviction Test PASSED!" << std::endl;
+}
+
+void test_cuda_manager() {
+    std::cout << "[TEST] Running CUDA Manager Test..." << std::endl;
+    ATSInferCudaManager cuda_mgr;
+    bool inited = cuda_mgr.init(0);
+    assert(inited);
+
+    void * host_ptr = cuda_mgr.alloc_pinned_host(1024 * 1024);
+    assert(host_ptr != nullptr);
+
+    void * ev = cuda_mgr.create_event();
+
+    bool sync_ok = cuda_mgr.wait_for_transfer_event(ev);
+    assert(sync_ok);
+
+    cuda_mgr.destroy_event(ev);
+    cuda_mgr.free_pinned_host(host_ptr);
+    cuda_mgr.cleanup();
+
+    std::cout << " -> CUDA Manager Test PASSED!" << std::endl;
+}
 
 void test_profiler() {
     std::cout << "[TEST] Running Profiler Test..." << std::endl;
@@ -138,6 +187,43 @@ void test_load_aware_rescheduler() {
     std::cout << " -> Load-Aware Rescheduler Test PASSED!" << std::endl;
 }
 
+void test_profile_serialization() {
+    std::cout << "[TEST] Running Profile Serialization Test..." << std::endl;
+    atsinfer_hardware_profile hw_orig;
+    hw_orig.pcie_bandwidth_mbps = 24000.0f;
+    hw_orig.pcie_d2h_bandwidth_mbps = 22000.0f;
+    hw_orig.gpu_vram_budget = 8192ULL * 1024 * 1024;
+    hw_orig.is_measured = true;
+
+    std::unordered_map<std::string, atsinfer_tensor_profile> profiles_orig;
+    atsinfer_tensor_profile p;
+    p.tensor_name = "blk.3.attn_q.weight";
+    p.size_bytes = 100 * 1024 * 1024;
+    p.exec_time_cpu_ms = 12.5f;
+    p.exec_time_gpu_ms = 1.2f;
+    p.layer_id = 3;
+    p.is_attn = true;
+    profiles_orig[p.tensor_name] = p;
+
+    std::string cache_path = "test_atsinfer_cache.txt";
+    bool saved = atsinfer_save_profile_cache(cache_path, hw_orig, profiles_orig);
+    assert(saved);
+
+    atsinfer_hardware_profile hw_loaded;
+    std::unordered_map<std::string, atsinfer_tensor_profile> profiles_loaded;
+    bool loaded = atsinfer_load_profile_cache(cache_path, hw_loaded, profiles_loaded);
+    assert(loaded);
+
+    assert(hw_loaded.pcie_bandwidth_mbps == hw_orig.pcie_bandwidth_mbps);
+    assert(hw_loaded.gpu_vram_budget == hw_orig.gpu_vram_budget);
+    assert(profiles_loaded.find("blk.3.attn_q.weight") != profiles_loaded.end());
+    assert(profiles_loaded["blk.3.attn_q.weight"].layer_id == 3);
+    assert(profiles_loaded["blk.3.attn_q.weight"].is_attn == true);
+
+    std::remove(cache_path.c_str());
+    std::cout << " -> Profile Serialization Test PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "==========================================" << std::endl;
     std::cout << "    ATSInfer Unit Test Suite Execution    " << std::endl;
@@ -148,9 +234,12 @@ int main() {
     test_static_placement_moe();
     test_dynamic_transfer_scheduler();
     test_load_aware_rescheduler();
+    test_profile_serialization();
+    test_tensor_cache();
+    test_cuda_manager();
 
     std::cout << "==========================================" << std::endl;
-    std::cout << "   ALL ATSINFER UNIT TESTS PASSED (5/5)   " << std::endl;
+    std::cout << "   ALL ATSINFER UNIT TESTS PASSED (8/8)   " << std::endl;
     std::cout << "==========================================" << std::endl;
     return 0;
 }

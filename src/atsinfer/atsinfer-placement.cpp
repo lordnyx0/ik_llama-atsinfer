@@ -1,4 +1,5 @@
 #include "atsinfer-placement.h"
+#include "ggml-backend.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -153,5 +154,21 @@ atsinfer_placement_decision atsinfer_compute_static_placement(
         result.total_vram_used_bytes += nonexp_decision.total_vram_used_bytes;
     }
 
+    return result;
+}
+
+std::unordered_map<std::string, ggml_backend_buffer_type_t> atsinfer_map_placement_to_buft(
+    const atsinfer_placement_decision & decision,
+    ggml_backend_buffer_type_t cpu_buft,
+    ggml_backend_buffer_type_t gpu_buft) {
+
+    std::unordered_map<std::string, ggml_backend_buffer_type_t> result;
+    for (const auto & kv : decision.placement) {
+        if (kv.second == ATSInferBackend::GPU) {
+            result[kv.first] = gpu_buft ? gpu_buft : cpu_buft;
+        } else {
+            result[kv.first] = cpu_buft;
+        }
+    }
     return result;
 }

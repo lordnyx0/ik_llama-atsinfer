@@ -2,6 +2,7 @@
 #define ATSINFER_PLACEMENT_H
 
 #include "atsinfer-profiler.h"
+#include "ggml-backend.h"
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -22,6 +23,13 @@ atsinfer_placement_decision atsinfer_compute_static_placement(
     const std::vector<atsinfer_tensor_profile> & tensor_profiles,
     size_t vram_budget_bytes,
     bool is_moe_model
+);
+
+// Map static placement decision to backend buffer type per tensor
+std::unordered_map<std::string, ggml_backend_buffer_type_t> atsinfer_map_placement_to_buft(
+    const atsinfer_placement_decision & decision,
+    ggml_backend_buffer_type_t cpu_buft,
+    ggml_backend_buffer_type_t gpu_buft
 );
 
 #endif // ATSINFER_PLACEMENT_H
