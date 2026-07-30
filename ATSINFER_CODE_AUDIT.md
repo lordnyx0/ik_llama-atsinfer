@@ -1,5 +1,13 @@
 # Auditoria técnica do ATSInfer no código-fonte
 
+> **DESATUALIZADO.** Esta auditoria descreve o estado *anterior* à integração. As lacunas que ela
+> aponta — sem flags CLI, sem integração ao loader, ao contexto e ao loop de decode — foram todas
+> fechadas depois, e os três mecanismos do paper foram implementados e **medidos**. Nenhum deles
+> supera os controles manuais que a fork já tem.
+>
+> Leia **[docs/atsinfer-findings.md](docs/atsinfer-findings.md)** para os números e as causas.
+> Este arquivo fica como registro do ponto de partida.
+
 Data da auditoria: 2026-07-30.
 
 ## Conclusão executiva

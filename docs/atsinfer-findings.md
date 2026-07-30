@@ -56,6 +56,34 @@ all, which caps everything the paper's coordination mechanism could recover.
 
 **Per expert-layer group, `t_c` ≈ 0.74 ms.**
 
+## Context depth dominates everything else
+
+Measured with `llama-sweep-bench -c 32768 -ub 512 -ngl 99 -ncmoe 20 -fa on -ctk q8_0 -ctv q8_0 -rtr`,
+which reports throughput at each depth instead of averaging:
+
+| N_KV | decode t/s | prefill t/s |
+| ---: | ---: | ---: |
+| 0 | 39.71 | 159.83 |
+| 2048 | 37.43 | 258.98 |
+| 4096 | 30.71 | 229.00 |
+| 8192 | 18.25 | 162.83 |
+| 12288 | 13.73 | 123.42 |
+| 16384 | 10.65 | 101.42 |
+| 20480 | 8.65 | 81.86 |
+| 25600 | 6.99 | 68.23 |
+
+**Decode falls 82%, from 39.7 to 7.0 tok/s, by 25k context.** Every other effect measured in this
+document is small next to this one — the whole ATSInfer question is worth a few percent, while
+filling the context costs a factor of five.
+
+This is not VRAM pressure: the KV cache is allocated up front, so the allocation at depth 25600 is
+identical to the one at depth 0. It also is not KV bandwidth — 315 MiB of KV read per token at
+~360 GB/s is under 1 ms, against the ~118 ms/token actually added. The cause was not isolated and
+is worth its own investigation; it is by far the highest-value target in this codebase.
+
+Practical consequence: **any benchmark taken at depth 0, including every `llama-bench` number in
+this document, is a best case that real usage does not see.**
+
 ## Results
 
 ### Static tensor placement (section 4.3)
