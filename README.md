@@ -23,16 +23,24 @@ This repository contains an experimental exploration of **ATSInfer** (*Automated
 
 ### 📊 Empirical Benchmark Results (Qwen3.6-35B-A3B MoE Model)
 
-Tested on NVIDIA GeForce RTX 3060 (12GB VRAM) + x86-64 CPU (8 Threads) with 32,000 context size and 19.70 GiB model weights:
+Tested on NVIDIA GeForce RTX 3060 (12GB VRAM) + x86-64 CPU (8 Threads) with 32,000 context size and 19.70 GiB model weights.
+
+> [!NOTE]
+> **Live Verification** (`llama-cli` — prompt: *"faça um texto sobre a lua"*, 264 tokens total, July 30 2026):
+> Decode throughput confirmed at **33.99 tok/s** — within 0.1% of the benchmark reference (**34.02 tok/s**), validating reproducibility.
 
 | Performance Metric | Official Baseline (`llama.cpp`) | **ik_llama.cpp / ATSInfer CUDA** | Performance Delta & Technical Cause |
 | :--- | :--- | :--- | :--- |
 | **Prefill Throughput (tok/s)** | 16.52 tok/s | **38.06 tok/s** | **+130.4% (+2.30× Speedup)** (Driven by `sched_async = 1` + Flash Attention) |
 | **Prompt Eval Time (20 tokens)** | 1,210.53 ms | **525.50 ms** | **56.6% Faster** (Reduced prompt evaluation latency) |
-| **Decode Throughput (tok/s)** | 32.46 tok/s | **34.02 tok/s** | **+4.8%** (Boosted by CUDA async stream transfer overlap & MoE expert cache) |
+| **Decode Throughput (tok/s)** | 32.46 tok/s | **34.02 tok/s** *(live: 33.99 tok/s ✅)* | **+4.8%** (Boosted by CUDA async stream transfer overlap & MoE expert cache) |
 | **Total Request Latency (256 tokens)** | 7,270.24 ms | **5,964.22 ms** | **1.31 Seconds Faster** total generation delivery |
-| **GPU VRAM Allocation** | 9.74 GiB | **9.86 GiB** | Physical VRAM budget enforced (Prevents WDDM 7.95 tok/s paging collapse) |
+| **GPU VRAM Allocation** | 9.74 GiB | **9.87 GiB** | Physical VRAM budget enforced (Prevents WDDM 7.95 tok/s paging collapse) |
 | **CPU Pinned RAM** | 10.19 GiB | **9.83 GiB** | Host Pinned Memory allocated for MoE expert weights (`cudaHostAlloc`) |
+
+**Live test config** (July 30 2026): `--fit --fit-margin 256 -rtr -fa on -ctk q8_0 -ctv q8_0 -c 32000 --temp 0.7 --top-k 40 -t 8 --no-mmap`
+- Repacked tensors: **63** | Graph splits: **44** | KV Cache (q8_0): **332.03 MiB**
+- `sched_async=1` ✅ | `flash_attn=1` ✅ | `fused_moe=1` ✅ | `only_active_experts scheduling` ✅
 
 ---
 
