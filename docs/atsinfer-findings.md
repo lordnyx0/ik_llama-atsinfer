@@ -90,6 +90,16 @@ Resulting profiles for this model, all landing near 9600–9900 MiB total:
 | 64k | 742.8 MiB | 25 | 9608.7 MiB |
 | 128k | 1422.8 MiB | 26 | 9790.7 MiB |
 
+Verified on the 32k profile, sweeping the full context with `--n-cpu-moe 24`:
+
+| depth | 0 | 4k | 8k | 16k | 24k | 32k |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| decode t/s | 33.78 | 34.49 | 32.79 | 32.35 | 30.64 | 29.21 |
+
+A 13.5% decline across the entire 32k context, smooth rather than a collapse. The same context at
+`--n-cpu-moe 20` gave 7.16 t/s at 24k — the corrected profile is **4.3x faster** there. Whatever
+residual decline remains is plausibly genuine attention cost; the rest was paging.
+
 This finding also invalidates an earlier reading of the same data. A single sweep at `-ncmoe 20`
 was first reported here as "decode falls 82% with context depth", attributed to attention cost. It
 was not: the numbers never fit that explanation — KV reads account for under 1 ms per token against
