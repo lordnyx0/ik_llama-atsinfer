@@ -7795,7 +7795,7 @@ struct llama_context * llama_init_from_model(
     }
     cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
     //cparams.split_mode_f16   = params.split_mode_f16;
-    cparams.scheduler_async  = params.scheduler_async;
+    cparams.scheduler_async  = params.scheduler_async || (!model->devices.empty());
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;

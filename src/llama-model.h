@@ -526,6 +526,7 @@ struct llama_model {
     layer_buft buft_input;
     layer_buft buft_output;
     std::vector<layer_buft> buft_layer;
+    std::unordered_map<std::string, layer_buft> buft_tensor;
 
     // contexts where the model tensors metadata is stored
     std::vector<struct ggml_context *> ctxs;

@@ -39,6 +39,9 @@ endif()
 
 add_library(llama
             ../include/llama.h
+            atsinfer/atsinfer-profiler.cpp
+            atsinfer/atsinfer-placement.cpp
+            atsinfer/atsinfer-scheduler.cpp
             llama.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
