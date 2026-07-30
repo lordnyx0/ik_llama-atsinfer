@@ -166,3 +166,7 @@ a.out.*
 
 # ATSInfer profiling cache (written to CWD at model load)
 atsinfer_profile.cache
+
+# personal launcher scripts (local model paths, not part of the project)
+2_Servidor_Web*.bat
+1_Interacao_Terminal.bat
