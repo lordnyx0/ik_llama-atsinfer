@@ -1,45 +1,47 @@
-# ik_llama.cpp: llama.cpp fork with ATSInfer & Enhanced CPU/GPU Acceleration
+# ik_llama.cpp: llama.cpp fork with ATSInfer Research Prototypes & Enhanced Hybrid CPU/GPU Offloading
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-## 🚀 ATSInfer Integration: Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference
+## 📌 Technical Status & ATSInfer Research Integration Audit
 
-This repository integrates **ATSInfer** (*Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference on Consumer Devices*, arXiv:2607.10183v2), introducing granular tensor offloading, dual CUDA streams pipelining, and static Knapsack DP tensor placement to maximize hybrid CPU-GPU performance on consumer hardware (e.g., NVIDIA RTX 3060 12GB VRAM + System DRAM).
+This repository contains an experimental exploration of **ATSInfer** (*Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference on Consumer Devices*, arXiv:2607.10183v2) alongside hybrid CPU/GPU performance enhancements built on top of `ik_llama.cpp`.
 
 ---
 
-### 📊 Benchmark Results Summary (Qwen3.6-35B-A3B MoE Model)
+### 🔍 Technical Audit & Architecture Breakdown
 
-| Performance Metric | Official Baseline (`llama.cpp`) | **ATSInfer Optimized** | Speedup / Performance Gain |
+> [!IMPORTANT]
+> **Implementation Scope & Transparency**:
+> - **Active Runtime Changes**: The runtime inference pipeline in `src/llama.cpp` and `src/llama-load-tensors.cpp` incorporates automatic asynchronous scheduling (`cparams.scheduler_async = 1`), granular MoE expert buffer overrides (`-ncmoe`), and physical VRAM budget fitting (`--fit`) to prevent Windows WDDM system memory thrashing.
+> - **ATSInfer Research Prototypes (`src/atsinfer/`)**: The files in `src/atsinfer/` (`atsinfer-placement.cpp`, `atsinfer-profiler.cpp`, `atsinfer-scheduler.cpp`) implement standalone algorithms of the ATSInfer paper (3D Knapsack DP placement solver, heuristic tensor profiler, and dynamic transfer decision logic). These algorithms are verified via unit tests (`tests/test-atsinfer.cpp`) as standalone research modules; they are not directly hooked into `ggml_graph` runtime tensor migration or `cudaMemcpyAsync` dispatch loops during `llama_decode`.
+
+---
+
+### 📊 Empirical Benchmark Results (Qwen3.6-35B-A3B MoE Model)
+
+Tested on NVIDIA GeForce RTX 3060 (12GB VRAM) + x86-64 CPU (8 Threads) with 32,000 context size and 19.70 GiB model weights:
+
+| Performance Metric | Official Baseline (`llama.cpp`) | **ik_llama.cpp / CUDA** | Performance Delta & Technical Cause |
 | :--- | :--- | :--- | :--- |
-| **Prefill Throughput (tok/s)** | 16.52 tok/s | **38.06 tok/s** | **+130.4% (+2.30× Speedup)** |
-| **Prompt Eval Time (20 tokens)** | 1,210.53 ms | **525.50 ms** | **56.6% Faster (Over 2× faster prompt processing)** |
-| **Decode Throughput (tok/s)** | 32.46 tok/s | **34.02 tok/s** | **+4.8% (34.02 tok/s / 29.40 ms per token)** |
-| **Total Request Latency (256 tokens)** | 7,270.24 ms | **5,964.22 ms** | **1.31 Seconds Faster Total Delivery** |
-| **GPU VRAM Allocation** | 9.74 GiB | **9.86 GiB** | 100% Resident in Physical VRAM (No System Paging) |
-| **CPU Pinned RAM** | 10.19 GiB | **9.83 GiB** | Host Pinned Memory for MoE Expert Weights |
+| **Prefill Throughput (tok/s)** | 16.52 tok/s | **38.06 tok/s** | **+130.4% (+2.30× Speedup)** (Driven by `sched_async = 1` + Flash Attention) |
+| **Prompt Eval Time (20 tokens)** | 1,210.53 ms | **525.50 ms** | **56.6% Faster** (Reduced prompt evaluation latency) |
+| **Decode Throughput (tok/s)** | 32.46 tok/s | **34.02 tok/s** | **+4.8%** (Bounded by host CPU DRAM bandwidth on MoE active experts) |
+| **Total Request Latency (256 tokens)** | 7,270.24 ms | **5,964.22 ms** | **1.31 Seconds Faster** total generation delivery |
+| **GPU VRAM Allocation** | 9.74 GiB | **9.86 GiB** | Physical VRAM limit enforced (Prevents WDDM 7.95 tok/s paging collapse) |
+| **CPU Pinned RAM** | 10.19 GiB | **9.83 GiB** | Host Pinned Memory allocated for MoE expert weights |
 
 ---
 
-### 🛠️ Key Architectural Modifications Introduced
+### 🛠️ Runtime Modifications Summary
 
-1. **Granular Tensor-Level Offloading (`buft_tensor`)**:
-   - Replaced coarse layer-by-layer buffer allocation (`buft_layer`) with granular tensor-level mapping (`buft_tensor` in `llama_model`).
-   - Pin 100% of latency-critical Attention projections (`attn_q`, `attn_k`, `attn_v`, `attn_output`) and LayerNorms in GPU VRAM (`CUDA0`), offloading only MoE expert weight matrices to CPU Pinned DRAM (`CUDA_Host`).
-
-2. **Asynchronous Dual CUDA Streams Scheduling (`sched_async = 1`)**:
-   - Implemented `transfer_stream` (CUDA Copy Engine) operating in parallel with `compute_stream` (GPU SM execution).
-   - Enables async Host-to-Device (H2D) transfers over PCIe while GPU kernels execute, eliminating GPU idle time during prompt evaluation.
-
-3. **Static Tensor Placement Solver (Knapsack DP with Physical VRAM Limit $M \le 10.5\text{ GiB}$)**:
-   - Integrated `src/atsinfer/atsinfer-placement.cpp` to solve optimal tensor placement under strict physical VRAM budgets ($M \le 10.5\text{ GiB}$ on 12GB cards), preventing Windows WDDM CUDA System Memory Paging.
-
----
-
-> [!NOTE]
-> **Hardware Limitation & Decode Analysis**:
-> In hybrid MoE inference (such as `Qwen3.6-35B-A3B` with ~9.8GB in VRAM and ~9.8GB in CPU DRAM), decode throughput is fundamentally **Host-Memory Bandwidth Bound** (DRAM read speeds + single-token `only_active_experts` routing).
-> While ATSInfer eliminates WDDM driver thrashing (which previously dropped decode down to 7.95 tok/s under VRAM overflow) and achieves a massive **+130.4% (2.30× speedup)** in Prefill throughput, decode throughput (~34 tok/s / 29.4 ms/tok) reaches the physical hardware bandwidth ceiling of consumer CPU/GPU systems.
+1. **Automatic Asynchronous CUDA Scheduling**:
+   - In `src/llama.cpp`, `cparams.scheduler_async` is automatically activated (`params.scheduler_async || (!model->devices.empty())`) for CUDA backends with active GPU devices.
+2. **MoE Granular Expert Buffer Overrides**:
+   - In `src/llama-load-tensors.cpp`, tensor regex overrides (`-ncmoe`) route heavy MoE expert weight matrices (`ffn_exps`) to Host Pinned DRAM (`CUDA_Host`) while pinning attention projections (`attn_q`, `attn_k`, `attn_v`, `attn_output`) and LayerNorms in GPU VRAM (`CUDA0`).
+3. **Physical VRAM Budget Enforcement**:
+   - Usage of `--fit --fit-margin 256` prevents Windows WDDM CUDA System Memory Paging, avoiding driver thrashing that drops decode performance down to ~7.95 tok/s when VRAM capacity is exceeded.
+4. **Standalone ATSInfer Unit Test Suite**:
+   - The standalone solver module in `src/atsinfer/` is built and verified via `tests/test-atsinfer.cpp` (`test-atsinfer.exe`).
 
 ---
 
