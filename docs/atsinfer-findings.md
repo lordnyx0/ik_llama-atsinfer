@@ -56,33 +56,49 @@ all, which caps everything the paper's coordination mechanism could recover.
 
 **Per expert-layer group, `t_c` ≈ 0.74 ms.**
 
-## Context depth dominates everything else
+## VRAM headroom, not context depth: the largest effect measured here
 
-Measured with `llama-sweep-bench -c 32768 -ub 512 -ngl 99 -ncmoe 20 -fa on -ctk q8_0 -ctv q8_0 -rtr`,
-which reports throughput at each depth instead of averaging:
+Sizing the GPU allocation to *fit* is not enough. On WDDM, pages are allocated but only become
+resident when touched, so a configuration that fits at load can start paging as the KV cache
+actually fills. The result is a decode collapse that looks like a context-length problem and is not.
 
-| N_KV | decode t/s | prefill t/s |
-| ---: | ---: | ---: |
-| 0 | 39.71 | 159.83 |
-| 2048 | 37.43 | 258.98 |
-| 4096 | 30.71 | 229.00 |
-| 8192 | 18.25 | 162.83 |
-| 12288 | 13.73 | 123.42 |
-| 16384 | 10.65 | 101.42 |
-| 20480 | 8.65 | 81.86 |
-| 25600 | 6.99 | 68.23 |
+Measured with `llama-sweep-bench -c 8192 -ub 512 -fa on -ctk q8_0 -ctv q8_0 -rtr`, varying only
+`--n-cpu-moe`:
 
-**Decode falls 82%, from 39.7 to 7.0 tok/s, by 25k context.** Every other effect measured in this
-document is small next to this one — the whole ATSInfer question is worth a few percent, while
-filling the context costs a factor of five.
+| depth | `-ncmoe 19` (11738 MiB) | `-ncmoe 23` (9878 MiB) | `-ncmoe 26` (8517 MiB) | `-ncmoe 30` (7653 MiB) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 40.66 | 34.89 | 32.62 | 29.03 |
+| 2048 | 39.91 | 35.88 | 32.27 | 30.23 |
+| 4096 | 31.68 | 34.88 | 31.68 | 29.18 |
+| 6144 | 23.98 | 34.91 | 31.52 | 29.73 |
+| 7680 | **20.05** | **34.64** | 26.93 | 27.12 |
 
-This is not VRAM pressure: the KV cache is allocated up front, so the allocation at depth 25600 is
-identical to the one at depth 0. It also is not KV bandwidth — 315 MiB of KV read per token at
-~360 GB/s is under 1 ms, against the ~118 ms/token actually added. The cause was not isolated and
-is worth its own investigation; it is by far the highest-value target in this codebase.
+`-ncmoe 19` fills the card (11738 MiB of ~11950 free) and is the fastest configuration at depth 0 —
+then loses 51% by 7.7k. `-ncmoe 23` leaves about 2 GiB of headroom, starts 14% slower, and stays
+**flat**, ending 73% faster than the aggressive setting.
 
-Practical consequence: **any benchmark taken at depth 0, including every `llama-bench` number in
-this document, is a best case that real usage does not see.**
+So the rule for this hardware is: **leave ~2 GiB of VRAM headroom above the reported allocation**,
+and pick the lowest `--n-cpu-moe` that respects it. Sizing to the allocation alone reliably produces
+a configuration that benchmarks well and degrades badly in use.
+
+Resulting profiles for this model, all landing near 9600–9900 MiB total:
+
+| context | KV | `--n-cpu-moe` | total |
+| ---: | ---: | ---: | ---: |
+| 8k | 147.8 MiB | 23 | 9877.7 MiB |
+| 32k | 402.8 MiB | 24 | 9700.7 MiB |
+| 64k | 742.8 MiB | 25 | 9608.7 MiB |
+| 128k | 1422.8 MiB | 26 | 9790.7 MiB |
+
+This finding also invalidates an earlier reading of the same data. A single sweep at `-ncmoe 20`
+was first reported here as "decode falls 82% with context depth", attributed to attention cost. It
+was not: the numbers never fit that explanation — KV reads account for under 1 ms per token against
+the ~118 ms actually added — and holding depth fixed while varying only `--n-cpu-moe` reproduces or
+removes the collapse at will.
+
+Practical consequence stands, for a different reason: **any benchmark taken at depth 0, including
+every `llama-bench` number in this document, is a best case.** A configuration must be swept across
+depth before it can be called good.
 
 ## Results
 
